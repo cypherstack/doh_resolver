@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:doh_resolver/doh_resolver_io.dart';
 import 'package:test/test.dart';
-import 'dns_test.dart' show reply, error;
+import 'dns_test.dart' show reply;
 import 'support/test_pki.dart';
 import 'support/tunnel_proxy.dart';
 
@@ -46,7 +46,10 @@ void main() {
               ? SocksProxy(InternetAddress.loopbackIPv4, proxy.port)
               : null,
           proxyDestination: proxied ? InternetAddress('8.8.8.8') : null);
-      final resolver = DohResolver(endpoint: endpoint(), transport: transport);
+      final resolver = DohResolver(
+          txtFormat: DnsTxtFormat.raw,
+          endpoint: endpoint(),
+          transport: transport);
       final result = await resolver.lookupTxt('alice.example');
       expect(result.records.single.text, 'oa1:xmr recipient_address=valid;');
       expect(result.resolver, endpoint());
@@ -69,12 +72,13 @@ void main() {
     await proxy.start();
     addTearDown(proxy.close);
     final resolver = DohResolver(
+        txtFormat: DnsTxtFormat.raw,
         endpoint: endpoint(),
         transport: IoDohTransport(
             securityContext: trust,
             proxy: SocksProxy(InternetAddress.loopbackIPv4, proxy.port)));
     await expectLater(resolver.lookupTxt('alice.example'),
-        throwsA(error(DnsError.transport)));
+        throwsA(isA<DnsTransportException>()));
     await Future<void>.delayed(const Duration(milliseconds: 50));
     expect(requests, 0);
     expect(proxy.connections, 1);
@@ -82,9 +86,12 @@ void main() {
   test('HTTPS identity must be trusted', () async {
     server.listen((r) => r.response.close(), onError: (Object _) {});
     await expectLater(
-        DohResolver(endpoint: endpoint(), transport: IoDohTransport())
+        DohResolver(
+                txtFormat: DnsTxtFormat.raw,
+                endpoint: endpoint(),
+                transport: IoDohTransport())
             .lookupTxt('alice.example'),
-        throwsA(error(DnsError.transport)));
+        throwsA(isA<DnsTransportException>()));
   });
   test('redirects never produce a second request', () async {
     var requests = 0;
@@ -97,10 +104,11 @@ void main() {
     });
     await expectLater(
         DohResolver(
+                txtFormat: DnsTxtFormat.raw,
                 endpoint: endpoint(),
                 transport: IoDohTransport(securityContext: trust))
             .lookupTxt('alice.example'),
-        throwsA(error(DnsError.transport)));
+        throwsA(isA<DnsTransportException>()));
     expect(requests, 1);
   });
   test('streaming response size limit aborts before parsing', () async {
@@ -111,11 +119,12 @@ void main() {
     });
     await expectLater(
         DohResolver(
+                txtFormat: DnsTxtFormat.raw,
                 endpoint: endpoint(),
                 maxResponseBytes: 128,
                 transport: IoDohTransport(securityContext: trust))
             .lookupTxt('alice.example'),
-        throwsA(error(DnsError.responseTooLarge)));
+        throwsA(isA<DnsResponseTooLargeException>()));
   });
   test('unsigned response is not accepted merely because HTTPS succeeded',
       () async {
@@ -126,10 +135,11 @@ void main() {
     });
     await expectLater(
         DohResolver(
+                txtFormat: DnsTxtFormat.raw,
                 endpoint: endpoint(),
                 transport: IoDohTransport(securityContext: trust))
             .lookupTxt('alice.example'),
-        throwsA(error(DnsError.authenticationUnavailable)));
+        throwsA(isA<DnsAuthenticationUnavailableException>()));
   });
   for (final cancel in [false, true]) {
     test('${cancel ? 'cancel' : 'timeout'} destroys stalled response transport',
@@ -145,14 +155,18 @@ void main() {
       await proxy.start();
       addTearDown(proxy.close);
       final resolver = DohResolver(
+          txtFormat: DnsTxtFormat.raw,
           endpoint: endpoint(),
           timeout: const Duration(milliseconds: 300),
           transport: IoDohTransport(
               securityContext: trust,
               proxy: SocksProxy(InternetAddress.loopbackIPv4, proxy.port)));
       final operation = resolver.startTxtLookup('alice.example');
-      final failed = expectLater(operation.result,
-          throwsA(error(cancel ? DnsError.cancelled : DnsError.timedOut)));
+      final failed = expectLater(
+          operation.result,
+          throwsA(cancel
+              ? isA<DnsCancelledException>()
+              : isA<DnsTimeoutException>()));
       await sent.future;
       if (cancel) operation.cancel();
       await failed;
@@ -185,10 +199,56 @@ void main() {
       r.response.close();
     });
     final result = await DohResolver(
+            txtFormat: DnsTxtFormat.raw,
             endpoint: endpoint(),
             transport: IoDohTransport(securityContext: trust))
         .lookupTxt('alice.example');
     expect(result.records, hasLength(1));
+  });
+  for (final (header, seconds) in [
+    (null, 0),
+    ('250', 250),
+    (' 7 ', 7),
+    ('000000000001', 1),
+    ('00000000000000000000', 0),
+    ('2147483648', 0x80000000),
+    ('99999999999', 0x80000000),
+    ('000099999999999', 0x80000000),
+    ('250, 0', 250),
+    ('5,abc', 5),
+    (', 5', 0),
+    ('-5', 0),
+    ('1.5', 0),
+    ('abc', 0),
+  ]) {
+    test('reports HTTP Age header $header as $seconds seconds', () async {
+      server.listen((r) {
+        r.response.headers.contentType = ContentType.json;
+        if (header != null) {
+          r.response.headers.set(HttpHeaders.ageHeader, header);
+        }
+        r.response.write(jsonEncode(reply()));
+        r.response.close();
+      });
+      final response = await IoDohTransport(securityContext: trust)
+          .start(endpoint(), maxResponseBytes: 65536)
+          .result;
+      expect(response.age, Duration(seconds: seconds));
+    });
+  }
+  test('uses the first of repeated HTTP Age headers', () async {
+    server.listen((r) {
+      r.response.headers
+        ..contentType = ContentType.json
+        ..add(HttpHeaders.ageHeader, '250')
+        ..add(HttpHeaders.ageHeader, '0');
+      r.response.write(jsonEncode(reply()));
+      r.response.close();
+    });
+    final response = await IoDohTransport(securityContext: trust)
+        .start(endpoint(), maxResponseBytes: 65536)
+        .result;
+    expect(response.age, const Duration(seconds: 250));
   });
   for (final (type, encoding) in [
     (null, null),
@@ -207,10 +267,11 @@ void main() {
       });
       await expectLater(
           DohResolver(
+                  txtFormat: DnsTxtFormat.raw,
                   endpoint: endpoint(),
                   transport: IoDohTransport(securityContext: trust))
               .lookupTxt('alice.example'),
-          throwsA(error(DnsError.malformedResponse)));
+          throwsA(isA<DnsMalformedResponseException>()));
     });
   }
 }

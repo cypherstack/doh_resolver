@@ -2,22 +2,23 @@ import 'dart:typed_data';
 
 import 'dns.dart';
 
-const _malformed =
-    DnsException(DnsError.malformedResponse, 'Malformed DNS wire message');
-const _mismatch = DnsException(
-    DnsError.questionMismatch, 'DNS wire response does not match query');
+const _malformed = DnsMalformedResponseException('Malformed DNS wire message');
+const _mismatch =
+    DnsQuestionMismatchException('DNS wire response does not match query');
 
 /// This is framing only: it never makes the answer trustworthy.
+/// Checks that wire [response] is a complete, well-formed answer to [query]:
+/// same ID, opcode and questions, not truncated, and EDNS version 0.
+/// Throws [DnsInvalidQueryException] for an unusable [query].
 void validateDnsWireResponse(List<int> query, List<int> response) {
   final sent = _parseOrNull(query);
   if (sent == null || sent.isResponse) {
-    throw ArgumentError('Invalid DNS wire query');
+    throw const DnsInvalidQueryException('Invalid DNS wire query');
   }
   final reply = _WireMessage.parse(response);
   if (!reply.isResponse) throw _malformed;
   if (reply.flags & 0x0200 != 0) {
-    throw const DnsException(
-        DnsError.malformedResponse, 'Truncated DNS wire response');
+    throw const DnsMalformedResponseException('Truncated DNS wire response');
   }
   if (reply.id != sent.id ||
       reply.opcode != sent.opcode ||
@@ -32,13 +33,38 @@ void validateDnsWireResponse(List<int> query, List<int> response) {
   }
 }
 
+/// A copy of wire [response] with every record TTL replaced by its
+/// [effectiveDnsTtl] after [age], such as `DohHttpResponse.age`. OPT is left
+/// alone: its TTL field carries EDNS flags. RRSIG validation is unaffected
+/// because it uses the signature's Original TTL, but SIG(0) and TSIG
+/// transaction signatures cover the whole message, so verify them first.
+List<int> adjustDnsWireTtls(List<int> response, {required Duration age}) {
+  if (age < Duration.zero) throw ArgumentError.value(age, 'age');
+  final message = _WireMessage.parse(response);
+  final adjusted = Uint8List.fromList(response);
+  for (final at in message.ttlOffsets) {
+    final ttl = message._u16(at) << 16 | message._u16(at + 2);
+    final value = effectiveDnsTtl(ttl, age: age);
+    adjusted
+      ..[at] = value >> 24
+      ..[at + 1] = value >> 16 & 0xff
+      ..[at + 2] = value >> 8 & 0xff
+      ..[at + 3] = value & 0xff;
+  }
+  return List<int>.unmodifiable(adjusted);
+}
+
+/// Pads [query] to a multiple of [blockSize] octets with an RFC 7830
+/// padding option, as RFC 8467 recommends. Queries without a final OPT
+/// record, already padded, or signed (signatures must stay last) are
+/// returned unchanged.
 List<int> padDnsWireQuery(List<int> query, {int blockSize = 128}) {
   if (blockSize < 1 || blockSize > 512) {
     throw ArgumentError.value(blockSize, 'blockSize');
   }
   final message = _parseOrNull(query);
   if (message == null || message.isResponse) {
-    throw ArgumentError('Invalid DNS wire query');
+    throw const DnsInvalidQueryException('Invalid DNS wire query');
   }
   final rdlength = message.optRdlengthOffset;
   if (rdlength == null || !message.optIsLast || message.optHasPadding) {
@@ -64,10 +90,13 @@ List<int> padDnsWireQuery(List<int> query, {int blockSize = 128}) {
 List<int> checkedDnsWireQuery(List<int> query) {
   final message = _parseOrNull(query);
   if (message == null || message.isResponse) {
-    throw ArgumentError('Invalid DNS wire query');
+    throw const DnsInvalidQueryException('Invalid DNS wire query');
   }
   return List<int>.unmodifiable(query);
 }
+
+bool isSignedDnsWireQuery(List<int> query) =>
+    _parseOrNull(query)?.isSigned ?? false;
 
 _WireMessage? _parseOrNull(List<int> bytes) {
   try {
@@ -104,6 +133,8 @@ class _WireMessage {
   int? optVersion;
   bool optIsLast = false;
   bool optHasPadding = false;
+  bool isSigned = false;
+  final ttlOffsets = <int>[];
   int _offset = 12;
 
   _WireMessage._(this.data);
@@ -155,6 +186,9 @@ class _WireMessage {
     final start = _offset + 10;
     final end = start + rdlength;
     if (end > data.length) throw _malformed;
+    if (type != 41) ttlOffsets.add(_offset + 4);
+    // SIG(0) and TSIG sign the header, including the ID.
+    if (additional && (type == 24 || type == 250)) isSigned = true;
     if (type == 41) {
       if (!additional || optRdlengthOffset != null || data[owner] != 0) {
         throw _malformed;
@@ -224,6 +258,54 @@ class _WireMessage {
         if (_offset >= end) throw _malformed;
       case 47:
         _name(limit: end, compressed: false);
+      // Newer types forbid compressing their own names, but a later name may
+      // still point into them, so each one is walked and registered.
+      case 55:
+        _skip(4, end);
+        final hitLength = data[_offset - 4];
+        final keyLength = _u16(_offset - 2);
+        _skip(hitLength + keyLength, end);
+        while (_offset < end) {
+          _name(limit: end, compressed: false);
+        }
+      case 58:
+        _name(limit: end, compressed: false);
+        _name(limit: end, compressed: false);
+      case 64 || 65 || 107:
+        _skip(2, end);
+        _name(limit: end, compressed: false);
+      case 249 || 250:
+        _name(limit: end, compressed: false);
+      case 23:
+        _name(limit: end, compressed: false);
+      case 66:
+        _skip(5, end);
+        _name(limit: end, compressed: false);
+      case 45:
+        // Precedence, gateway type and algorithm, then the gateway.
+        _skip(3, end);
+        switch (data[_offset - 2]) {
+          case 1:
+            _skip(4, end);
+          case 2:
+            _skip(16, end);
+          case 3:
+            _name(limit: end, compressed: false);
+        }
+      case 260:
+        _skip(2, end);
+        switch (data[_offset - 1] & 0x7f) {
+          case 0:
+            break;
+          case 1:
+            _skip(4, end);
+          case 2:
+            _skip(16, end);
+          case 3:
+            _name(limit: end, compressed: false);
+          default:
+            _offset = end;
+        }
     }
     if (_offset > end ||
         ({
@@ -246,7 +328,13 @@ class _WireMessage {
               35,
               36,
               38,
-              39
+              23,
+              39,
+              55,
+              58,
+              66,
+              107,
+              260
             }.contains(type) &&
             _offset != end)) {
       throw _malformed;

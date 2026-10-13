@@ -8,6 +8,8 @@ import 'dns.dart';
 import 'resolver.dart';
 import 'wire.dart';
 
+/// A SOCKS5 proxy, addressed numerically so no local DNS lookup is needed.
+/// Use [SocksCredentials.isolation] for Tor stream isolation.
 class SocksProxy {
   final InternetAddress host;
   final int port;
@@ -15,22 +17,49 @@ class SocksProxy {
   const SocksProxy(this.host, this.port, {this.credentials});
 }
 
+/// A `dart:io` HTTPS/1.1 DoH transport, direct or through SOCKS5.
+///
+/// It verifies the endpoint certificate, never follows redirects, never falls
+/// back from a configured proxy to a direct connection, bounds bodies and
+/// deadlines, and admits at most [maxConcurrentRequests] running plus
+/// [maxQueuedRequests] waiting operations. Call [close] when done.
 class IoDohTransport implements DohTransport, DohWireTransport {
   final SocksProxy? proxy;
+
+  /// Sends every proxied request to this address instead of letting the proxy
+  /// resolve the endpoint host. It applies to all endpoints used with this
+  /// transport; TLS still verifies the requested host name.
   final InternetAddress? proxyDestination;
   final SecurityContext? securityContext;
   final Duration connectionTimeout;
+
+  /// The deadline for each operation, including time spent queued.
   final Duration requestTimeout;
   final Duration idleTimeout;
   final int maxConcurrentRequests;
   final int maxQueuedRequests;
+
+  /// Whether wire queries are padded with [padDnsWireQuery].
   final bool padQueries;
+
+  /// Whether wire queries to the same origin share connections. Defaults to
+  /// off with a [proxy]: a shared connection lets the resolver link lookups
+  /// that would otherwise travel over separate (for example Tor) streams.
+  /// The transport rewrites each wire ID to keep it unique on a connection
+  /// and restores the caller's ID in the response, except for SIG(0)- or
+  /// TSIG-signed queries and `preserveMessage` exchanges, whose IDs are kept
+  /// and still never repeat on a connection. JSON requests never share
+  /// connections.
   final bool reuseConnections;
   int _active = 0;
   bool _closed = false;
   final _waiting = Queue<_IoRequest>();
   final _running = <_IoRequest>{};
   final _idle = <_Lane>[];
+  // Lanes fork from here: forking from Zone.current during a queued handoff
+  // would parent each new lane on its predecessor and keep the chain alive.
+  final _zone = Zone.current;
+  final _random = Random.secure();
   IoDohTransport(
       {this.proxy,
       this.proxyDestination,
@@ -41,7 +70,8 @@ class IoDohTransport implements DohTransport, DohWireTransport {
       this.maxConcurrentRequests = 8,
       this.maxQueuedRequests = 64,
       this.padQueries = true,
-      this.reuseConnections = true}) {
+      bool? reuseConnections})
+      : reuseConnections = reuseConnections ?? proxy == null {
     if (proxy == null && proxyDestination != null) {
       throw ArgumentError('proxyDestination requires an explicit proxy');
     }
@@ -62,11 +92,24 @@ class IoDohTransport implements DohTransport, DohWireTransport {
 
   @override
   DnsOperation<DohHttpResponse> startWire(Uri uri, List<int> query,
-      {required int maxResponseBytes}) {
-    return _start(uri, min(maxResponseBytes, 65535),
-        padQueries ? padDnsWireQuery(query) : checkedDnsWireQuery(query));
+      {required int maxResponseBytes, bool preserveMessage = false}) {
+    final List<int> checked;
+    final bool preserved;
+    try {
+      // SIG(0) and TSIG sign the header, so signed queries are always kept.
+      preserved = preserveMessage || isSignedDnsWireQuery(query);
+      checked = padQueries && !preserved
+          ? padDnsWireQuery(query)
+          : checkedDnsWireQuery(query);
+    } on DnsException catch (error) {
+      return DnsOperation.failed(error);
+    }
+    return _start(uri, min(maxResponseBytes, 65535), checked, preserved);
   }
 
+  /// Fails queued and running operations with [DnsCancelledException], fails
+  /// later starts the same way, and begins closing every connection. Socket
+  /// teardown finishes asynchronously after this returns.
   Future<void> close() async {
     _closed = true;
     for (final request in [..._waiting, ..._running]) {
@@ -78,28 +121,25 @@ class IoDohTransport implements DohTransport, DohWireTransport {
   }
 
   DnsOperation<DohHttpResponse> _start(Uri uri, int maxResponseBytes,
-      [List<int>? query]) {
+      [List<int>? query, bool preserved = false]) {
     if (uri.scheme != 'https' ||
         uri.host.isEmpty ||
         uri.userInfo.isNotEmpty ||
         uri.hasFragment ||
         maxResponseBytes < 1) {
-      throw ArgumentError('Expected a bounded HTTPS request');
+      return DnsOperation.failed(
+          const DnsInvalidQueryException('Expected a bounded HTTPS request'));
     }
     if (_closed) {
-      return DnsOperation(
-          Future.error(
-              const DnsException(DnsError.cancelled, 'DNS transport closed')),
-          () {});
+      return DnsOperation.failed(
+          const DnsCancelledException('DNS transport closed'));
     }
     if (_active >= maxConcurrentRequests &&
         _waiting.length >= maxQueuedRequests) {
-      return DnsOperation(
-          Future.error(const DnsException(
-              DnsError.transport, 'DNS transport request queue is full')),
-          () {});
+      return DnsOperation.failed(
+          const DnsTransportException('DNS transport request queue is full'));
     }
-    final request = _IoRequest(this, uri, maxResponseBytes, query);
+    final request = _IoRequest(this, uri, maxResponseBytes, query, preserved);
     if (_active < maxConcurrentRequests) {
       _active++;
       _run(request);
@@ -113,10 +153,13 @@ class IoDohTransport implements DohTransport, DohWireTransport {
     _Lane? lane;
     final origin = _origin(request.uri);
     if (request.query case final query?) {
-      final id = query[0] << 8 | query[1];
+      final callerId = query[0] << 8 | query[1];
       for (var i = _idle.length - 1; i >= 0; i--) {
         final candidate = _idle[i];
-        if (candidate.origin == origin && !candidate.hasUsedWireId(id)) {
+        if (candidate.origin == origin &&
+            (request.preserved
+                ? candidate.canClaim(callerId)
+                : candidate.hasFreeWireIds)) {
           _idle.removeAt(i);
           lane = candidate;
           break;
@@ -132,19 +175,34 @@ class IoDohTransport implements DohTransport, DohWireTransport {
     }
     lane.owner = request;
     request.lane = lane;
+    if (request.query case final query?) {
+      // The transport owns the ID on the wire. Callers may all send ID 0 as
+      // RFC 8484 recommends, yet a stale reply on a reused connection still
+      // fails the ID check instead of answering the next request. Preserved
+      // queries keep their ID, which is still never repeated on a connection,
+      // and their response is returned exactly as received.
+      final callerId = query[0] << 8 | query[1];
+      if (request.preserved) {
+        lane.claimWireId(_random, callerId);
+        request.sent = query;
+      } else {
+        final id = lane.claimWireId(_random);
+        request.sent = Uint8List.fromList(query)
+          ..[0] = id >> 8
+          ..[1] = id & 0xff;
+      }
+    }
     _running.add(request);
     lane.zone.run(request.run);
   }
 
   _Lane _newLane(_Origin origin) {
     final lane = _Lane(origin);
-    lane.zone = Zone.current.fork(specification:
+    lane.zone = _zone.fork(specification:
         ZoneSpecification(handleUncaughtError: (_, __, ___, error, stack) {
       if (lane.owner case final owner?) {
         owner._finish(
-            const DnsException(
-                DnsError.transport, 'Resolver connection failed'),
-            stack);
+            const DnsTransportException('Resolver connection failed'), stack);
       } else {
         _retire(lane);
       }
@@ -165,8 +223,8 @@ class IoDohTransport implements DohTransport, DohWireTransport {
               owner._done ||
               _origin(destination) != lane.origin ||
               _origin(owner.uri) != lane.origin) {
-            throw const DnsException(
-                DnsError.cancelled, 'DNS connection cancelled or redirected');
+            throw const DnsCancelledException(
+                'DNS connection cancelled or redirected');
           }
           final task = SocksConnection.start(
               proxyHost: proxy.host,
@@ -209,7 +267,6 @@ class IoDohTransport implements DohTransport, DohWireTransport {
         reuseConnections &&
         !_closed &&
         !lane.retired) {
-      lane.markWireIdUsed(request.query![0] << 8 | request.query![1]);
       lane.owner = null;
       _idle.add(lane);
     } else {
@@ -221,6 +278,17 @@ class IoDohTransport implements DohTransport, DohWireTransport {
       _run(_waiting.removeFirst());
     }
   }
+}
+
+// RFC 9111 §5.1: use the first member of a list-valued or repeated Age, and
+// ignore it if that member is not delta-seconds. Values beyond 2^31 saturate.
+Duration _age(List<String>? values) {
+  if (values == null || values.isEmpty) return Duration.zero;
+  final first = values.first.split(',').first.trim();
+  if (!RegExp(r'^[0-9]+$').hasMatch(first)) return Duration.zero;
+  final digits = first.replaceFirst(RegExp(r'^0+'), '');
+  final seconds = digits.length > 10 ? null : int.parse('0$digits');
+  return Duration(seconds: min(seconds ?? 0x80000000, 0x80000000));
 }
 
 typedef _Origin = ({String scheme, String host, int port});
@@ -237,14 +305,32 @@ class _Lane {
   late final HttpClient client;
   final tasks = <ConnectionTask<Socket>>{};
   final _usedWireIds = Uint8List(8192);
+  var _usedWireIdCount = 0;
   _IoRequest? owner;
   bool retired = false;
 
   _Lane(this.origin);
 
-  bool hasUsedWireId(int id) => _usedWireIds[id >> 3] & (1 << (id & 7)) != 0;
+  // Retiring at half the ID space keeps random selection to ~2 draws.
+  bool get hasFreeWireIds => _usedWireIdCount < 32768;
 
-  void markWireIdUsed(int id) => _usedWireIds[id >> 3] |= 1 << (id & 7);
+  bool canClaim(int id) => hasFreeWireIds && !_isUsed(id);
+
+  bool _isUsed(int id) => _usedWireIds[id >> 3] & (1 << (id & 7)) != 0;
+
+  /// Claims [id], or a random unused ID when none is given.
+  int claimWireId(Random random, [int? id]) {
+    id ??= () {
+      while (true) {
+        final candidate = random.nextInt(65536);
+        if (!_isUsed(candidate)) return candidate;
+      }
+    }();
+    assert(!_isUsed(id));
+    _usedWireIds[id >> 3] |= 1 << (id & 7);
+    _usedWireIdCount++;
+    return id;
+  }
 }
 
 class _IoRequest {
@@ -252,15 +338,15 @@ class _IoRequest {
   final Uri uri;
   final int limit;
   final List<int>? query;
+  List<int>? sent;
+  final bool preserved;
   final result = Completer<DohHttpResponse>();
   _Lane? lane;
   late final Timer _deadline;
   bool _done = false;
-  _IoRequest(this.transport, this.uri, this.limit, this.query) {
-    _deadline = Timer(
-        transport.requestTimeout,
-        () => _finish(
-            const DnsException(DnsError.timedOut, 'DNS request timed out')));
+  _IoRequest(this.transport, this.uri, this.limit, this.query, this.preserved) {
+    _deadline = Timer(transport.requestTimeout,
+        () => _finish(const DnsTimeoutException('DNS request timed out')));
   }
 
   void _finish(Object outcome, [StackTrace? stack]) {
@@ -276,7 +362,7 @@ class _IoRequest {
   }
 
   void cancel() =>
-      _finish(const DnsException(DnsError.cancelled, 'DNS request cancelled'));
+      _finish(const DnsCancelledException('DNS request cancelled'));
 
   Future<void> run() async {
     if (_done) return;
@@ -291,50 +377,52 @@ class _IoRequest {
       request.headers.removeAll(HttpHeaders.acceptEncodingHeader);
       request.headers.set(HttpHeaders.acceptHeader,
           query == null ? 'application/dns-json' : 'application/dns-message');
-      if (query != null) {
+      if (sent case final sent?) {
         request.headers.contentType = ContentType('application', 'dns-message');
-        request.contentLength = query!.length;
-        request.add(query!);
+        request.contentLength = sent.length;
+        request.add(sent);
       }
       final response = await request.close();
       if (response.statusCode != 200) {
-        throw DnsException(DnsError.transport, 'Resolver HTTP request failed',
-            responseCode: response.statusCode);
+        throw DnsTransportException('Resolver HTTP request failed',
+            httpStatus: response.statusCode);
       }
       final mime = response.headers.contentType?.mimeType;
       if (query == null
           ? mime != 'application/json' && mime != 'application/dns-json'
           : mime != 'application/dns-message') {
-        throw const DnsException(
-            DnsError.malformedResponse, 'Unexpected DNS response media type');
+        throw const DnsMalformedResponseException(
+            'Unexpected DNS response media type');
       }
       if (response.headers.value(HttpHeaders.contentEncodingHeader)
           case final encoding? when encoding.toLowerCase() != 'identity') {
-        throw const DnsException(
-            DnsError.malformedResponse, 'Encoded DNS response');
+        throw const DnsMalformedResponseException('Encoded DNS response');
       }
       if (response.contentLength > limit) {
-        throw const DnsException(
-            DnsError.responseTooLarge, 'DNS body exceeds limit');
+        throw const DnsResponseTooLargeException('DNS body exceeds limit');
       }
       final bytes = BytesBuilder(copy: false);
       await for (final chunk in response) {
         if (bytes.length + chunk.length > limit) {
-          throw const DnsException(
-              DnsError.responseTooLarge, 'DNS body exceeds limit');
+          throw const DnsResponseTooLargeException('DNS body exceeds limit');
         }
         bytes.add(chunk);
         if (_done) return;
       }
       final body = bytes.takeBytes();
-      if (query != null) validateDnsWireResponse(query!, body);
-      _finish(DohHttpResponse(response.statusCode, body));
+      if (sent case final sent?) {
+        validateDnsWireResponse(sent, body);
+        body
+          ..[0] = query![0]
+          ..[1] = query![1];
+      }
+      _finish(DohHttpResponse(response.statusCode, body,
+          age: _age(response.headers[HttpHeaders.ageHeader])));
     } catch (error, stack) {
       _finish(
           error is DnsException
               ? error
-              : const DnsException(
-                  DnsError.transport, 'Resolver connection failed'),
+              : const DnsTransportException('Resolver connection failed'),
           stack);
     }
   }
