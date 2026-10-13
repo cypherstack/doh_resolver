@@ -40,7 +40,11 @@ final class DnsQueryFailedException extends DnsException {
 
 /// A response that was not marked authenticated, had checking disabled, or
 /// was truncated, so it carries no resolver DNSSEC assertion.
-final class DnsAuthenticationUnavailableException extends DnsException {
+///
+/// Local validators may extend this to report why their own validation did
+/// not establish a secure answer; `switch` over [DnsException] still treats
+/// every such subtype as this case.
+base class DnsAuthenticationUnavailableException extends DnsException {
   const DnsAuthenticationUnavailableException(super.message);
 }
 
@@ -189,7 +193,6 @@ final class DnsValidationIssuer {
     if (name.isEmpty) throw ArgumentError.value(name, 'name');
   }
 
-  // Call only after signatures are verified; this checks owner binding.
   /// Issues evidence for [records] at [canonicalName], reached from
   /// [question] through [aliases]. Call only after verifying the signatures;
   /// this checks owner binding and bounds, not cryptography.

@@ -100,6 +100,7 @@ void main() {
           DnsTimeoutException() => 'timeout',
         };
     expect(describe(const DnsAliasLoopException('loop')), 'alias');
+    expect(describe(const _LocalValidationException()), 'unauthenticated');
     expect(describe(const DnsQueryFailedException('x', rcode: 3)), 'rcode 3');
     expect(const DnsTimeoutException('late').toString(),
         'DnsTimeoutException: late');
@@ -395,10 +396,14 @@ void main() {
     operation.cancel();
     expect(transport.uri, isNull);
   });
-  test('endpoints with undecodable query parameters are rejected up front', () {
+  test('endpoints with undecodable parameters or ports are rejected up front',
+      () {
     for (final endpoint in [
       'https://resolver.example/resolve?x=%FF',
       'https://resolver.example/resolve?%C3=1',
+      'https://resolver.example:0/resolve',
+      'https://resolver.example:70000/resolve',
+      'https://resolver.example:99999999999999999999/resolve',
     ]) {
       expect(
           () => DohResolver(
@@ -511,4 +516,10 @@ class _ThrowingTransport implements DohTransport {
   DnsOperation<DohHttpResponse> start(Uri uri,
           {required int maxResponseBytes}) =>
       throw error;
+}
+
+/// What a local DNSSEC validator reports: the one open extension point.
+final class _LocalValidationException
+    extends DnsAuthenticationUnavailableException {
+  const _LocalValidationException() : super('bogus');
 }
