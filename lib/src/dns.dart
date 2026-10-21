@@ -59,7 +59,7 @@ final class DohResolverQuestionMismatchException extends DohResolverException {
       {super.cause, super.causeStackTrace});
 }
 
-/// The resolver returned a non-success HTTP [statusCode].
+/// The resolver answered with HTTP [statusCode] instead of 200.
 final class DohResolverHttpStatusException extends DohResolverException {
   final int statusCode;
   const DohResolverHttpStatusException(super.message,
