@@ -630,6 +630,24 @@ void main() {
     await expectLater(failed, throwsA(isA<DohResolverTransportException>()));
     expect(failing.cancelled, isFalse);
   });
+  test('a body of exactly maxResponseBytes is accepted, one more is not',
+      () async {
+    const limit = 512;
+    final json = utf8.encode(jsonEncode(reply()));
+    final padded = [...json, ...List.filled(limit - json.length, 0x20)];
+    final accepting = FakeDohResolverTransport([
+      DohResolverResponse(padded),
+      DohResolverResponse([...padded, 0x20])
+    ]);
+    final resolver = DohResolver(transport: accepting, maxResponseBytes: limit);
+    expect((await resolver.lookupTxt('alice.example')).records, hasLength(1));
+    await expectLater(
+        resolver.lookupTxt('alice.example'),
+        throwsA(isA<DohResolverResponseTooLargeException>()
+            .having((e) => e.kind, 'kind', DohResolverLimitKind.responseBytes)
+            .having((e) => e.maximum, 'maximum', limit)
+            .having((e) => e.actual, 'actual', limit + 1)));
+  });
 }
 
 class _ThrowingResponse implements DohResolverResponse {
