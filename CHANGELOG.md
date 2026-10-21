@@ -1,8 +1,8 @@
-## 0.0.1 - unreleased
+## 0.0.1
 
-- Initial JSON resolver with bounded response parsing, provider-specific TXT
-  decoding, strict CNAME traversal, resolver-asserted DNSSEC results, sealed
-  named exceptions, and cache lifetimes derived from the answer and its CNAME
-  chain.
-- Transport port (`DohResolverTransport`, `DohResolverOperation`,
-  `DohResolverResponse`); the package has no dependencies.
+- First release.
+- TXT lookups through DoH JSON APIs that accept only resolver-asserted DNSSEC
+  answers.
+- Caller-supplied transport port (`DohResolverTransport`) that receives the
+  endpoint's media type.
+- Google and Cloudflare presets for TXT format and media type.
