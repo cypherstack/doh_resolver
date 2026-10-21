@@ -21,24 +21,37 @@ class DohResolver {
   /// How [endpoint] writes TXT data. Known Google and Cloudflare hosts get
   /// their format by default; any other endpoint must pass it explicitly.
   final DohResolverTxtFormat txtFormat;
+
+  /// The JSON media type [endpoint] serves, chosen like [txtFormat].
+  final String mediaType;
   late final Map<String, List<String>> _endpointParameters;
 
   /// Creates a resolver for [endpoint], Google's JSON API by default.
   ///
-  /// Throws [ArgumentError] for an unusable [endpoint], invalid limits, or an
-  /// unknown provider without [txtFormat]. Endpoint query parameters are kept
-  /// except those the resolver sets itself.
+  /// Throws [ArgumentError] for an unusable [endpoint], invalid limits, an
+  /// invalid [mediaType], or an unknown provider without [txtFormat] or
+  /// [mediaType]. Endpoint query parameters are kept except those the
+  /// resolver sets itself.
   DohResolver(
       {required this.transport,
       Uri? endpoint,
       this.timeout = const Duration(seconds: 12),
       this.maxResponseBytes = 65536,
-      DohResolverTxtFormat? txtFormat})
+      DohResolverTxtFormat? txtFormat,
+      String? mediaType})
       : endpoint = endpoint ??= Uri.https('dns.google', '/resolve'),
         txtFormat = txtFormat ??
             _knownTxtFormat(endpoint.host) ??
             (throw ArgumentError.value(endpoint, 'endpoint',
-                'Pass txtFormat: JSON TXT encoding differs between providers')) {
+                'Pass txtFormat: JSON TXT encoding differs between providers')),
+        mediaType = mediaType ??
+            _knownMediaType(endpoint.host) ??
+            (throw ArgumentError.value(endpoint, 'endpoint',
+                'Pass mediaType: JSON media types differ between providers')) {
+    if (this.mediaType.isEmpty || this.mediaType.contains(RegExp(r'[;\s]'))) {
+      throw ArgumentError.value(
+          this.mediaType, 'mediaType', 'A bare type/subtype is required');
+    }
     if (!isUsableEndpoint(this.endpoint)) {
       throw ArgumentError(
           'A credential-free HTTPS resolver endpoint is required');
@@ -86,7 +99,7 @@ class DohResolver {
     final DohResolverOperation<DohResolverResponse> operation;
     try {
       operation = transport.start(endpoint.replace(queryParameters: parameters),
-          maxResponseBytes: maxResponseBytes);
+          mediaType: mediaType, maxResponseBytes: maxResponseBytes);
     } on DohResolverException catch (error) {
       return DohResolverOperation.failed(error);
     } catch (error, stack) {
@@ -156,18 +169,32 @@ class DohResolver {
   }
 }
 
-DohResolverTxtFormat? _knownTxtFormat(String host) => switch (host) {
+enum _Provider { google, cloudflare }
+
+_Provider? _knownProvider(String host) => switch (host) {
       'dns.google' ||
       'dns.google.com' ||
       '8.8.8.8' ||
       '8.8.4.4' =>
-        DohResolverTxtFormat.raw,
+        _Provider.google,
       'cloudflare-dns.com' ||
       'one.one.one.one' ||
       '1.1.1.1' ||
       '1.0.0.1' =>
-        DohResolverTxtFormat.quoted,
-      _ when host.endsWith('.cloudflare-dns.com') =>
-        DohResolverTxtFormat.quoted,
+        _Provider.cloudflare,
+      _ when host.endsWith('.cloudflare-dns.com') => _Provider.cloudflare,
       _ => null,
+    };
+
+DohResolverTxtFormat? _knownTxtFormat(String host) =>
+    switch (_knownProvider(host)) {
+      _Provider.google => DohResolverTxtFormat.raw,
+      _Provider.cloudflare => DohResolverTxtFormat.quoted,
+      null => null,
+    };
+
+String? _knownMediaType(String host) => switch (_knownProvider(host)) {
+      _Provider.google => 'application/json',
+      _Provider.cloudflare => 'application/dns-json',
+      null => null,
     };

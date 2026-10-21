@@ -47,8 +47,10 @@ class DohResolverResponse {
 ///   wrapped as a [DohResolverTransportException];
 /// - make [DohResolverOperation.cancel] idempotent;
 /// - verify the server certificate and enforce `maxResponseBytes` while
-///   reading, failing with [DohResolverResponseTooLargeException].
+///   reading, failing with [DohResolverResponseTooLargeException];
+/// - send `mediaType` as `Accept` and fail a response whose `Content-Type`
+///   has another media type.
 abstract interface class DohResolverTransport {
   DohResolverOperation<DohResolverResponse> start(Uri uri,
-      {required int maxResponseBytes});
+      {required String mediaType, required int maxResponseBytes});
 }

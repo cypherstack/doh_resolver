@@ -275,30 +275,78 @@ void main() {
           throwsA(isA<DohResolverMalformedResponseException>()));
     }
   });
-  test('known resolvers get their TXT format; others must choose', () {
-    DohResolverTxtFormat formatOf(String url) => DohResolver(
-            transport: FakeDohResolverTransport(), endpoint: Uri.parse(url))
-        .txtFormat;
-    expect(DohResolver(transport: FakeDohResolverTransport()).txtFormat,
-        DohResolverTxtFormat.raw);
-    expect(formatOf('https://dns.google/resolve'), DohResolverTxtFormat.raw);
+  test('known resolvers get their TXT format and media type; others choose',
+      () {
+    DohResolver resolverFor(String url) => DohResolver(
+        transport: FakeDohResolverTransport(), endpoint: Uri.parse(url));
+    final google = DohResolver(transport: FakeDohResolverTransport());
+    expect(google.txtFormat, DohResolverTxtFormat.raw);
+    expect(google.mediaType, 'application/json');
+    for (final host in ['dns.google', '8.8.8.8']) {
+      expect(resolverFor('https://$host/resolve').txtFormat,
+          DohResolverTxtFormat.raw);
+      expect(
+          resolverFor('https://$host/resolve').mediaType, 'application/json');
+    }
     for (final host in [
       'cloudflare-dns.com',
       'security.cloudflare-dns.com',
       'one.one.one.one',
       '1.1.1.1'
     ]) {
-      expect(formatOf('https://$host/dns-query'), DohResolverTxtFormat.quoted);
+      final resolver = resolverFor('https://$host/dns-query');
+      expect(resolver.txtFormat, DohResolverTxtFormat.quoted);
+      expect(resolver.mediaType, 'application/dns-json');
     }
-    expect(() => formatOf('https://resolver.example/resolve'),
-        throwsArgumentError);
-    expect(
-        DohResolver(
-                transport: FakeDohResolverTransport(),
-                endpoint: Uri.parse('https://dns.google/resolve'),
-                txtFormat: DohResolverTxtFormat.quoted)
-            .txtFormat,
-        DohResolverTxtFormat.quoted);
+    final unknown = Uri.parse('https://resolver.example/resolve');
+    expect(() => resolverFor('$unknown'), throwsArgumentError);
+    for (final (format, type) in [
+      (DohResolverTxtFormat.raw, null),
+      (null, 'application/dns-json'),
+    ]) {
+      expect(
+          () => DohResolver(
+              transport: FakeDohResolverTransport(),
+              endpoint: unknown,
+              txtFormat: format,
+              mediaType: type),
+          throwsArgumentError);
+    }
+    final custom = DohResolver(
+        transport: FakeDohResolverTransport(),
+        endpoint: Uri.parse('https://dns.google/resolve'),
+        txtFormat: DohResolverTxtFormat.quoted,
+        mediaType: 'application/dns-json');
+    expect(custom.txtFormat, DohResolverTxtFormat.quoted);
+    expect(custom.mediaType, 'application/dns-json');
+  });
+  test('mediaType must be a bare type/subtype', () {
+    for (final type in ['', 'application/json; charset=utf-8', 'a /b']) {
+      expect(
+          () => DohResolver(
+              transport: FakeDohResolverTransport(),
+              endpoint: Uri.parse('https://resolver.example/resolve'),
+              txtFormat: DohResolverTxtFormat.raw,
+              mediaType: type),
+          throwsA(
+              isA<ArgumentError>().having((e) => e.name, 'name', 'mediaType')));
+    }
+  });
+  test('the transport receives the media type', () {
+    final transport = FakeDohResolverTransport();
+    DohResolver(transport: transport).startTxtLookup('alice.example');
+    DohResolver(
+            transport: transport,
+            endpoint: Uri.parse('https://cloudflare-dns.com/dns-query'))
+        .startTxtLookup('alice.example');
+    DohResolver(
+            transport: transport,
+            endpoint: Uri.parse('https://resolver.example/resolve'),
+            txtFormat: DohResolverTxtFormat.raw,
+            mediaType: 'application/x-custom')
+        .startTxtLookup('alice.example');
+    expect(transport.mediaTypes,
+        ['application/json', 'application/dns-json', 'application/x-custom']);
   });
   for (final (endpoint, data, text) in [
     ('https://dns.google/resolve', '"hello"', '"hello"'),
@@ -361,6 +409,7 @@ void main() {
     final transport = FakeDohResolverTransport();
     DohResolver(
             txtFormat: DohResolverTxtFormat.raw,
+            mediaType: 'application/dns-json',
             transport: transport,
             endpoint: Uri.parse('https://dns.example/resolve'
                 '?tag=first&tag=second&name=evil&type=A&type=AAAA'))
@@ -377,6 +426,7 @@ void main() {
       final transport = FakeDohResolverTransport();
       DohResolver(
               txtFormat: DohResolverTxtFormat.raw,
+              mediaType: 'application/dns-json',
               transport: transport,
               endpoint: Uri.parse('https://dns.example/resolve?ct=x'))
           .startTxtLookup(name);
@@ -420,6 +470,7 @@ void main() {
       expect(
           () => DohResolver(
               txtFormat: DohResolverTxtFormat.raw,
+              mediaType: 'application/dns-json',
               transport: FakeDohResolverTransport(),
               endpoint: Uri.parse(endpoint)),
           throwsArgumentError);

@@ -14,6 +14,7 @@ class FakeDohResolverTransport implements DohResolverTransport {
 
   final Queue<Object> _script;
   final requests = <Uri>[];
+  final mediaTypes = <String>[];
   final _pending = <Completer<DohResolverResponse>>[];
   int cancellations = 0;
   bool throwOnCancel = false;
@@ -34,10 +35,11 @@ class FakeDohResolverTransport implements DohResolverTransport {
 
   @override
   DohResolverOperation<DohResolverResponse> start(Uri uri,
-      {required int maxResponseBytes}) {
+      {required String mediaType, required int maxResponseBytes}) {
     final error = throwOnStart;
     if (error != null) throw error;
     requests.add(uri);
+    mediaTypes.add(mediaType);
     final completer = Completer<DohResolverResponse>();
     _pending.add(completer);
     if (_script.isNotEmpty) {

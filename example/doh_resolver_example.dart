@@ -15,7 +15,7 @@ class HttpClientDohResolverTransport implements DohResolverTransport {
 
   @override
   DohResolverOperation<DohResolverResponse> start(Uri uri,
-      {required int maxResponseBytes}) {
+      {required String mediaType, required int maxResponseBytes}) {
     final done = Completer<DohResolverResponse>();
     HttpClientRequest? request;
     void fail(DohResolverException error) {
@@ -32,11 +32,15 @@ class HttpClientDohResolverTransport implements DohResolverTransport {
         final current = request = await _client.getUrl(uri);
         if (done.isCompleted) return current.abort();
         current.followRedirects = false;
-        current.headers.set(HttpHeaders.acceptHeader, 'application/dns-json');
+        current.headers.set(HttpHeaders.acceptHeader, mediaType);
         final response = await current.close();
         if (response.statusCode != HttpStatus.ok) {
           return fail(DohResolverHttpStatusException('Request failed',
               statusCode: response.statusCode));
+        }
+        if (response.headers.contentType?.mimeType != mediaType.toLowerCase()) {
+          return fail(const DohResolverMalformedResponseException(
+              'Unexpected Content-Type'));
         }
         final body = <int>[];
         await for (final chunk in response) {
