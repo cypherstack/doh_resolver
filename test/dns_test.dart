@@ -321,7 +321,17 @@ void main() {
     expect(custom.mediaType, 'application/dns-json');
   });
   test('mediaType must be a bare type/subtype', () {
-    for (final type in ['', 'application/json; charset=utf-8', 'a /b']) {
+    for (final type in [
+      '',
+      'application/json; charset=utf-8',
+      'a /b',
+      'json',
+      'a/b,c/d',
+      'a/',
+      '/b',
+      'a/b;q=1',
+      'a/b/c',
+    ]) {
       expect(
           () => DohResolver(
               transport: FakeDohResolverTransport(),
@@ -330,6 +340,16 @@ void main() {
               mediaType: type),
           throwsA(
               isA<ArgumentError>().having((e) => e.name, 'name', 'mediaType')));
+    }
+    for (final type in ['application/dns-json', 'application/json']) {
+      expect(
+          DohResolver(
+                  transport: FakeDohResolverTransport(),
+                  endpoint: Uri.parse('https://resolver.example/resolve'),
+                  txtFormat: DohResolverTxtFormat.raw,
+                  mediaType: type)
+              .mediaType,
+          type);
     }
   });
   test('the transport receives the media type', () {

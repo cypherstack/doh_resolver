@@ -26,6 +26,10 @@ class DohResolver {
   final String mediaType;
   late final Map<String, List<String>> _endpointParameters;
 
+  // RFC 9110 token "/" token.
+  static final _mediaTypePattern =
+      RegExp(r"^[-!#$%&'*+.^_`|~0-9A-Za-z]+/[-!#$%&'*+.^_`|~0-9A-Za-z]+$");
+
   /// Creates a resolver for [endpoint], Google's JSON API by default.
   ///
   /// Throws [ArgumentError] for an unusable [endpoint], invalid limits, an
@@ -48,7 +52,7 @@ class DohResolver {
             _knownMediaType(endpoint.host) ??
             (throw ArgumentError.value(endpoint, 'endpoint',
                 'Pass mediaType: JSON media types differ between providers')) {
-    if (this.mediaType.isEmpty || this.mediaType.contains(RegExp(r'[;\s]'))) {
+    if (!_mediaTypePattern.hasMatch(this.mediaType)) {
       throw ArgumentError.value(
           this.mediaType, 'mediaType', 'A bare type/subtype is required');
     }
